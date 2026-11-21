@@ -38,8 +38,7 @@ router.post("/create-checkout-session", async (req, res) => {
     const appointmentResult = await appointmentCollection.insertOne(appointment);
 
     const session = await stripe.checkout.sessions.create({
-      line_items: [
-        {
+      line_items: [        {
           price_data: {
             currency: "usd",
             product_data: {
@@ -59,7 +58,7 @@ router.post("/create-checkout-session", async (req, res) => {
         userId: payload.userId,
       },
     });
-    
+
 
     res.send({
       success: true,

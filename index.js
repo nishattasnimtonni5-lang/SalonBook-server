@@ -1,15 +1,16 @@
-import express from 'express'
-import cors from 'cors';
-import { MongoClient, ObjectId } from 'mongodb';
-import nodemailer from 'nodemailer';
-import Stripe from 'stripe';
-import 'dotenv/config';
+import express from "express";
+import cors from "cors";
+import { MongoClient, ObjectId } from "mongodb";
+import nodemailer from "nodemailer";
+import Stripe from "stripe";
+import "dotenv/config";
 
-const app=express();
-const PORT=8000;
+const app = express();
+const PORT = 8000;
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-const client = new MongoClient(process.env.MONGODB_URI )
+const client = new MongoClient(process.env.MONGODB_URI);
 
 export async function connectToMongoDB() {
   try {
@@ -18,6 +19,7 @@ export async function connectToMongoDB() {
     return client;
   } catch (err) {
     console.dir(err);
+    throw err;
   }
 }
 
@@ -28,6 +30,7 @@ const servicesCollection = database.collection("services");
 const appointmentsCollection = database.collection("appointments");
 const reportsCollection = database.collection("reports");
 const offersCollection = database.collection("offers");
+
 const REPORT_CATEGORIES = [
   "Service Quality",
   "Staff Behaviour",
@@ -127,7 +130,10 @@ async function sendAdminReportEmail(report) {
     host: SMTP_HOST,
     port: Number(SMTP_PORT) || 587,
     secure: Number(SMTP_PORT) === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
   });
 
   await transporter.sendMail({
@@ -138,84 +144,121 @@ async function sendAdminReportEmail(report) {
   });
 }
 
-app.use(express.json())
-app.use(cors())
-
+app.use(cors({
+  origin: process.env.CLIENT_URL || "http://localhost:3000",
+}));
 
 app.post(
   "/api/webhooks/stripe",
+  (req, res, next) => {
+    console.log("WEBHOOK REQUEST RECEIVED");
+    next();
+  },
   express.raw({ type: "application/json" }),
   async (req, res) => {
-    
-    const stripeEvent = req.body;
+    console.log("WEBHOOK ROUTE HIT");
     const signature = req.headers["stripe-signature"];
 
-   
     let event;
+
     try {
       event = stripe.webhooks.constructEvent(
-        stripeEvent,
+        req.body,
         signature,
-        process.env.STRIPE_WEBHOOK_SECRET,
+        process.env.STRIPE_WEBHOOK_SECRET
       );
-    } catch (e) {
-      console.log("Stripe webhook verification failed:", e.message);
-      return res.status(400).send(`Webhook Error: ${e.message}`);
+    } catch (error) {
+      console.log("Stripe webhook verification failed:", error.message);
+      return res.status(400).send(`Webhook Error: ${error.message}`);
     }
 
-    
     console.log("Stripe event received:", event.type);
 
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
-    
+      const appointmentId = session.metadata?.appointmentId;
+console.log("FULL SESSION METADATA:", session.metadata);
+console.log("SESSION ID:", session.id);
       console.log(
-        "Payment completed for booking:",
-        session.metadata?.bookingId,
+        "Payment completed for appointment:",
+        appointmentId
       );
-     
-      await appointmentsCollection.updateOne(
-        { _id: new ObjectId(session.metadata?.bookingId) },
-        { $set: { status: "confirmed", paymentStatus: "paid" } },
-      );
+
+      if (!appointmentId || !ObjectId.isValid(appointmentId)) {
+        console.log("Invalid appointment ID in Stripe metadata");
+        return res.status(400).send({
+          message: "Invalid appointment ID",
+        });
+      }
+
+      try {
+        const result = await appointmentsCollection.updateOne(
+          {
+            _id: new ObjectId(appointmentId),
+          },
+          {
+            $set: {
+              status: "confirmed",
+              paymentStatus: "paid",
+            },
+          }
+        );
+
+        console.log("Appointment updated:", result.modifiedCount);
+      } catch (error) {
+        console.log("Appointment update failed:", error);
+        return res.status(500).send({
+          message: "Appointment update failed",
+        });
+      }
     }
 
-    
     res.json({ received: true });
-  },
+  }
 );
 
-
-app.use(
-  cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
-  }),
-);
-
+app.use(express.json());
 
 
 app.post("/bookings/create-checkout-session", async (req, res) => {
   try {
     const clientUrl =
       process.env.CLIENT_URL ||
-      (process.env.NODE_ENV === "production" ? undefined : "http://localhost:3000");
+      (process.env.NODE_ENV === "production"
+        ? undefined
+        : "http://localhost:3000");
 
     if (!clientUrl) {
-      return res.status(500).send({ message: "Checkout is not configured" });
+      return res.status(500).send({
+        message: "Checkout is not configured",
+      });
     }
+
     const clientBaseUrl = new URL(clientUrl);
 
     if (!["http:", "https:"].includes(clientBaseUrl.protocol)) {
-      return res.status(500).send({ message: "Checkout is not configured" });
+      return res.status(500).send({
+        message: "Checkout is not configured",
+      });
     }
 
     const payload = req.body;
+
+    if (!ObjectId.isValid(payload.serviceId)) {
+      return res.status(400).send({
+        message: "Invalid service ID",
+      });
+    }
+
     const service = await servicesCollection.findOne({
       _id: new ObjectId(payload.serviceId),
+      status: "active",
     });
 
     if (!service) {
-      return res.status(404).send({ message: "Service not found" });
+      return res.status(404).send({
+        message: "Service not found or inactive",
+      });
     }
 
     const appointmentResult = await appointmentsCollection.insertOne({
@@ -234,6 +277,11 @@ app.post("/bookings/create-checkout-session", async (req, res) => {
       createdAt: new Date(),
     });
 
+    console.log(
+      "CREATING CHECKOUT FOR:",
+      appointmentResult.insertedId.toString()
+    );
+
     const session = await stripe.checkout.sessions.create({
       line_items: [
         {
@@ -248,36 +296,50 @@ app.post("/bookings/create-checkout-session", async (req, res) => {
           quantity: 1,
         },
       ],
+
       success_url: new URL(
         `/appointment/success?appointmentId=${appointmentResult.insertedId}`,
-        clientBaseUrl,
+        clientBaseUrl
       ).toString(),
-      cancel_url: new URL("/appointment/cancel", clientBaseUrl).toString(),
+
+      cancel_url: new URL(
+        "/appointment/cancel",
+        clientBaseUrl
+      ).toString(),
+
       mode: "payment",
+
       metadata: {
         appointmentId: appointmentResult.insertedId.toString(),
         userId: payload.userId,
       },
     });
 
+    console.log("CREATED SESSION:", session.id);
+    console.log("CREATED METADATA:", session.metadata);
+
     res.send({
       success: true,
       message: "Checkout session created",
-      data: { redirectUrl: session.url },
+      data: {
+        redirectUrl: session.url,
+      },
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Failed to create checkout session" });
+    console.error("Checkout session error:", error);
+
+    res.status(500).send({
+      message: "Failed to create checkout session",
+    });
   }
 });
 
-app.listen(PORT,()=>{
-    console.log('SERVER IS RUNNING GOOD');
-})
 
-app.get('/',(req,res)=>{
-    res.send({message:'Server is running'})
-})
+app.get("/", (req, res) => {
+  res.send({
+    message: "Server is running",
+  });
+});
 
 app.get("/services", async (req, res) => {
   try {
@@ -289,13 +351,19 @@ app.get("/services", async (req, res) => {
     res.status(200).send(services);
   } catch (error) {
     console.log(error);
-    res.status(500).send({ message: "Failed to fetch services" });
+    res.status(500).send({
+      message: "Failed to fetch services",
+    });
   }
 });
+
 app.get("/services/featured", async (req, res) => {
   try {
     const services = await servicesCollection
-      .find({ status: "active", featured: true })
+      .find({
+        status: "active",
+        featured: true,
+      })
       .sort({ createdAt: -1 })
       .limit(6)
       .toArray();
@@ -303,40 +371,54 @@ app.get("/services/featured", async (req, res) => {
     res.status(200).send(services);
   } catch (error) {
     console.log(error);
-    res.status(500).send({ message: "Failed to fetch featured services" });
+    res.status(500).send({
+      message: "Failed to fetch featured services",
+    });
   }
 });
 
 app.post("/appointments", async (req, res) => {
   try {
-    const appointmentData = req.body
+    const appointmentData = req.body;
 
     const result = await appointmentsCollection.insertOne({
       ...appointmentData,
       status: "pending",
       createdAt: new Date(),
-    })
+    });
 
     res.send({
       success: true,
       insertedId: result.insertedId,
-    })
+    });
   } catch (error) {
-    res.status(500).send({ message: "Failed to book appointment" })
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to book appointment",
+    });
   }
-})
+});
 
 app.patch("/appointments/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const { status, paymentStatus } = req.body;
 
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid appointment ID",
+      });
+    }
+
     const update = {};
+
     if (status) update.status = status;
     if (paymentStatus) update.paymentStatus = paymentStatus;
 
     if (Object.keys(update).length === 0) {
-      return res.status(400).send({ message: "Nothing to update" });
+      return res.status(400).send({
+        message: "Nothing to update",
+      });
     }
 
     const result = await appointmentsCollection.updateOne(
@@ -345,13 +427,20 @@ app.patch("/appointments/:id", async (req, res) => {
     );
 
     if (result.matchedCount === 0) {
-      return res.status(404).send({ message: "Appointment not found" });
+      return res.status(404).send({
+        message: "Appointment not found",
+      });
     }
 
-    res.send({ success: true, modifiedCount: result.modifiedCount });
+    res.send({
+      success: true,
+      modifiedCount: result.modifiedCount,
+    });
   } catch (error) {
     console.log(error);
-    res.status(500).send({ message: "Failed to update appointment" });
+    res.status(500).send({
+      message: "Failed to update appointment",
+    });
   }
 });
 
@@ -360,15 +449,21 @@ app.get("/appointments", async (req, res) => {
     const result = await appointmentsCollection.find().toArray();
     res.send(result);
   } catch (error) {
-    res.status(500).send({ message: "Failed to fetch appointments" });
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to fetch appointments",
+    });
   }
 });
 
 app.post("/reports", async (req, res) => {
   try {
     const secret = process.env.INTERNAL_API_SECRET;
+
     if (!secret || req.headers["x-internal-secret"] !== secret) {
-      return res.status(401).send({ message: "Unauthorized" });
+      return res.status(401).send({
+        message: "Unauthorized",
+      });
     }
 
     const {
@@ -393,24 +488,28 @@ app.post("/reports", async (req, res) => {
 
     for (const [field, value] of Object.entries(requiredStrings)) {
       if (typeof value !== "string" || !value.trim()) {
-        return res.status(400).send({ message: `${field} is required.` });
+        return res.status(400).send({
+          message: `${field} is required.`,
+        });
       }
     }
 
     if (!REPORT_CATEGORIES.includes(category)) {
-      return res.status(400).send({ message: "Invalid issue category." });
+      return res.status(400).send({
+        message: "Invalid issue category.",
+      });
     }
 
     if (subject.trim().length > 200) {
-      return res
-        .status(400)
-        .send({ message: "Subject must be 200 characters or fewer." });
+      return res.status(400).send({
+        message: "Subject must be 200 characters or fewer.",
+      });
     }
 
     if (description.trim().length > 5000) {
-      return res
-        .status(400)
-        .send({ message: "Description must be 5000 characters or fewer." });
+      return res.status(400).send({
+        message: "Description must be 5000 characters or fewer.",
+      });
     }
 
     const report = {
@@ -420,9 +519,13 @@ app.post("/reports", async (req, res) => {
       category: category.trim(),
       subject: subject.trim(),
       relatedService:
-        typeof relatedService === "string" ? relatedService.trim() : "",
+        typeof relatedService === "string"
+          ? relatedService.trim()
+          : "",
       appointmentId:
-        typeof appointmentId === "string" ? appointmentId.trim() : "",
+        typeof appointmentId === "string"
+          ? appointmentId.trim()
+          : "",
       description: description.trim(),
       status: "Pending",
       submittedAt: new Date(),
@@ -445,9 +548,12 @@ app.post("/reports", async (req, res) => {
     });
   } catch (error) {
     console.log(error);
-    res.status(500).send({ message: "Failed to submit report" });
+    res.status(500).send({
+      message: "Failed to submit report",
+    });
   }
 });
+
 app.post("/services", async (req, res) => {
   try {
     const serviceData = req.body;
@@ -502,6 +608,7 @@ app.post("/services", async (req, res) => {
     });
   }
 });
+
 app.post("/offers", async (req, res) => {
   try {
     const {
@@ -532,9 +639,11 @@ app.post("/offers", async (req, res) => {
       });
     }
 
+    const offerStatus = status || "active";
+
     if (
       !["percentage", "fixed"].includes(discountType) ||
-      !["active", "inactive"].includes(status)
+      !["active", "inactive"].includes(offerStatus)
     ) {
       return res.status(400).send({
         message: "Invalid offer information.",
@@ -569,7 +678,7 @@ app.post("/offers", async (req, res) => {
       startDate,
       expiryDate,
       promoCode: promoCode || "",
-      status: status || "active",
+      status: offerStatus,
       createdAt: new Date(),
     };
 
@@ -587,6 +696,7 @@ app.post("/offers", async (req, res) => {
     });
   }
 });
+
 app.get("/offers", async (req, res) => {
   try {
     const offers = await offersCollection
@@ -601,4 +711,8 @@ app.get("/offers", async (req, res) => {
       message: "Failed to fetch offers.",
     });
   }
+});
+
+app.listen(PORT, () => {
+  console.log("SERVER IS RUNNING GOOD");
 });
