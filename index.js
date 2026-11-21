@@ -141,6 +141,59 @@ async function sendAdminReportEmail(report) {
 app.use(express.json())
 app.use(cors())
 
+
+app.post(
+  "/api/webhooks/stripe",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    
+    const stripeEvent = req.body;
+    const signature = req.headers["stripe-signature"];
+
+   
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        stripeEvent,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET,
+      );
+    } catch (e) {
+      console.log("Stripe webhook verification failed:", e.message);
+      return res.status(400).send(`Webhook Error: ${e.message}`);
+    }
+
+    
+    console.log("Stripe event received:", event.type);
+
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+    
+      console.log(
+        "Payment completed for booking:",
+        session.metadata?.bookingId,
+      );
+     
+      await appointmentsCollection.updateOne(
+        { _id: new ObjectId(session.metadata?.bookingId) },
+        { $set: { status: "confirmed", paymentStatus: "paid" } },
+      );
+    }
+
+    
+    res.json({ received: true });
+  },
+);
+
+
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL || "http://localhost:3000",
+  }),
+);
+
+
+
 app.post("/bookings/create-checkout-session", async (req, res) => {
   try {
     const clientUrl =
