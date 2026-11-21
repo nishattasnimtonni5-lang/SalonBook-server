@@ -2,10 +2,12 @@ import express from 'express'
 import cors from 'cors';
 import { MongoClient, ObjectId } from 'mongodb';
 import nodemailer from 'nodemailer';
+import Stripe from 'stripe';
 import 'dotenv/config';
 
 const app=express();
 const PORT=8000;
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const client = new MongoClient(process.env.MONGODB_URI )
 
@@ -30,7 +32,7 @@ const REPORT_CATEGORIES = [
   "Service Quality",
   "Staff Behaviour",
   "Payment Issue",
-  "Booking Issue",
+  "appointment Issue",
   "Inappropriate Behaviour / Abuse",
   "Other",
 ];
@@ -139,6 +141,83 @@ async function sendAdminReportEmail(report) {
 app.use(express.json())
 app.use(cors())
 
+app.post("/bookings/create-checkout-session", async (req, res) => {
+  try {
+    const clientUrl =
+      process.env.CLIENT_URL ||
+      (process.env.NODE_ENV === "production" ? undefined : "http://localhost:3000");
+
+    if (!clientUrl) {
+      return res.status(500).send({ message: "Checkout is not configured" });
+    }
+    const clientBaseUrl = new URL(clientUrl);
+
+    if (!["http:", "https:"].includes(clientBaseUrl.protocol)) {
+      return res.status(500).send({ message: "Checkout is not configured" });
+    }
+
+    const payload = req.body;
+    const service = await servicesCollection.findOne({
+      _id: new ObjectId(payload.serviceId),
+    });
+
+    if (!service) {
+      return res.status(404).send({ message: "Service not found" });
+    }
+
+    const appointmentResult = await appointmentsCollection.insertOne({
+      serviceId: payload.serviceId,
+      serviceName: service.name,
+      serviceImage: service.image,
+      price: service.price,
+      duration: service.duration,
+      userId: payload.userId,
+      customerName: payload.customerName,
+      customerEmail: payload.customerEmail,
+      date: payload.date,
+      time: payload.time,
+      status: "pending",
+      paymentStatus: "unpaid",
+      createdAt: new Date(),
+    });
+
+    const session = await stripe.checkout.sessions.create({
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: service.name,
+              description: service.description,
+            },
+            unit_amount: Math.round(Number(service.price) * 100),
+          },
+          quantity: 1,
+        },
+      ],
+      success_url: new URL(
+        `/appointment/success?appointmentId=${appointmentResult.insertedId}`,
+        clientBaseUrl,
+      ).toString(),
+      cancel_url: new URL("/appointment/cancel", clientBaseUrl).toString(),
+      mode: "payment",
+      metadata: {
+        appointmentId: appointmentResult.insertedId.toString(),
+        userId: payload.userId,
+      },
+    });
+
+    res.send({
+      success: true,
+      message: "Checkout session created",
+      data: { redirectUrl: session.url },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to create checkout session" });
+  }
+});
+
 app.listen(PORT,()=>{
     console.log('SERVER IS RUNNING GOOD');
 })
@@ -151,13 +230,27 @@ app.get("/services", async (req, res) => {
   try {
     const services = await servicesCollection
       .find({ status: "active" })
-      .limit(6)
+      .sort({ createdAt: -1 })
       .toArray();
 
     res.status(200).send(services);
   } catch (error) {
     console.log(error);
     res.status(500).send({ message: "Failed to fetch services" });
+  }
+});
+app.get("/services/featured", async (req, res) => {
+  try {
+    const services = await servicesCollection
+      .find({ status: "active", featured: true })
+      .sort({ createdAt: -1 })
+      .limit(6)
+      .toArray();
+
+    res.status(200).send(services);
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Failed to fetch featured services" });
   }
 });
 
@@ -300,5 +393,159 @@ app.post("/reports", async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).send({ message: "Failed to submit report" });
+  }
+});
+app.post("/services", async (req, res) => {
+  try {
+    const serviceData = req.body;
+
+    const {
+      name,
+      category,
+      price,
+      duration,
+      description,
+      image,
+      featured,
+      status,
+    } = serviceData;
+
+    if (
+      !name ||
+      !category ||
+      price === undefined ||
+      !duration ||
+      !description ||
+      !image
+    ) {
+      return res.status(400).send({
+        message: "Please provide all required service information.",
+      });
+    }
+
+    const newService = {
+      name,
+      category,
+      price: Number(price),
+      duration: Number(duration),
+      description,
+      image,
+      featured: featured === true,
+      status: status || "active",
+      createdAt: new Date(),
+    };
+
+    const result = await servicesCollection.insertOne(newService);
+
+    res.status(201).send({
+      success: true,
+      message: "Service added successfully!",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to add service.",
+    });
+  }
+});
+app.post("/offers", async (req, res) => {
+  try {
+    const {
+      title,
+      image,
+      description,
+      discountType,
+      discountValue,
+      category,
+      startDate,
+      expiryDate,
+      promoCode,
+      status,
+    } = req.body;
+
+    if (
+      !title ||
+      !image ||
+      !description ||
+      !discountType ||
+      discountValue === undefined ||
+      !category ||
+      !startDate ||
+      !expiryDate
+    ) {
+      return res.status(400).send({
+        message: "Please provide all required offer information.",
+      });
+    }
+
+    if (
+      !["percentage", "fixed"].includes(discountType) ||
+      !["active", "inactive"].includes(status)
+    ) {
+      return res.status(400).send({
+        message: "Invalid offer information.",
+      });
+    }
+
+    const value = Number(discountValue);
+
+    if (
+      !Number.isFinite(value) ||
+      value <= 0 ||
+      (discountType === "percentage" && value > 100)
+    ) {
+      return res.status(400).send({
+        message: "Invalid discount value.",
+      });
+    }
+
+    if (new Date(expiryDate) < new Date(startDate)) {
+      return res.status(400).send({
+        message: "Expiry date must be after start date.",
+      });
+    }
+
+    const newOffer = {
+      title,
+      image,
+      description,
+      discountType,
+      discountValue: value,
+      category,
+      startDate,
+      expiryDate,
+      promoCode: promoCode || "",
+      status: status || "active",
+      createdAt: new Date(),
+    };
+
+    const result = await offersCollection.insertOne(newOffer);
+
+    res.status(201).send({
+      success: true,
+      message: "Offer published successfully!",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to publish offer.",
+    });
+  }
+});
+app.get("/offers", async (req, res) => {
+  try {
+    const offers = await offersCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).send(offers);
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to fetch offers.",
+    });
   }
 });
