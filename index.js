@@ -218,7 +218,7 @@ console.log("SESSION ID:", session.id);
 );
 
 app.use(express.json());
-
+console.log("CHECKOUT ROUTE ENTERED");
 
 app.post("/bookings/create-checkout-session", async (req, res) => {
   try {

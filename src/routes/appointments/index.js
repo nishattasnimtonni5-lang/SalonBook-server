@@ -36,7 +36,7 @@ router.post("/create-checkout-session", async (req, res) => {
     };
 
     const appointmentResult = await appointmentCollection.insertOne(appointment);
-
+console.log("BEFORE STRIPE SESSION");
     const session = await stripe.checkout.sessions.create({
       line_items: [        {
           price_data: {
@@ -59,7 +59,8 @@ router.post("/create-checkout-session", async (req, res) => {
       },
     });
 
-
+console.log("CREATED CHECKOUT SESSION:", session.id);
+console.log("CREATED SESSION METADATA:", session.metadata);
     res.send({
       success: true,
       message: "Checkout session created",
