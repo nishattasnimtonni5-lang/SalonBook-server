@@ -4,6 +4,9 @@ import { MongoClient, ObjectId } from "mongodb";
 import nodemailer from "nodemailer";
 import Stripe from "stripe";
 import "dotenv/config";
+import { betterAuth } from "better-auth";
+import { mongodbAdapter } from "@better-auth/mongo-adapter";
+import { fromNodeHeaders } from "better-auth/node";
 
 const app = express();
 const PORT = 8000;
@@ -31,6 +34,56 @@ const appointmentsCollection = database.collection("appointments");
 const reportsCollection = database.collection("reports");
 const offersCollection = database.collection("offers");
 
+const auth = betterAuth({
+  database: mongodbAdapter(database, {
+    client: connectedClient,
+  }),
+
+  user: {
+    additionalFields: {
+      role: {
+        type: "string",
+        required: false,
+        defaultValue: "customer",
+        input: false,
+      },
+    },
+  },
+
+  secret: process.env.BETTER_AUTH_SECRET,
+  baseURL: process.env.BETTER_AUTH_URL,
+});
+
+const requireAdmin = async (req, res, next) => {
+  try {
+    const session = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+
+    if (!session) {
+      return res.status(401).send({
+        message: "Unauthorized. Please login first.",
+      });
+    }
+
+    if (session.user.role !== "admin") {
+      return res.status(403).send({
+        message: "Access denied. Admin only.",
+      });
+    }
+
+    req.user = session.user;
+    next();
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Authentication failed.",
+    });
+  }
+};
+
+
+
 const REPORT_CATEGORIES = [
   "Service Quality",
   "Staff Behaviour",
@@ -39,6 +92,37 @@ const REPORT_CATEGORIES = [
   "Inappropriate Behaviour / Abuse",
   "Other",
 ];
+
+// Booking states and their safe transitions. "completed" and "cancelled"
+// are terminal; "confirmed" is only reached from "pending" (verified
+// Stripe webhook or an explicit admin action). paymentStatus is NOT part
+// of this table — it is written exclusively by the Stripe webhook.
+const APPOINTMENT_STATUSES = ["pending", "confirmed", "completed", "cancelled"];
+
+const STATUS_TRANSITIONS = {
+  pending: ["confirmed", "cancelled", "completed"],
+  confirmed: ["completed", "cancelled"],
+  completed: [],
+  cancelled: [],
+};
+
+// Public base URL that the Stripe success/cancel redirects point at.
+function resolveClientBaseUrl() {
+  const clientUrl =
+    process.env.CLIENT_URL ||
+    (process.env.NODE_ENV === "production"
+      ? undefined
+      : "http://localhost:3000");
+
+  if (!clientUrl) return null;
+
+  try {
+    const parsed = new URL(clientUrl);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
 function escapeHtml(value) {
   return String(value)
@@ -146,6 +230,7 @@ async function sendAdminReportEmail(report) {
 
 app.use(cors({
   origin: process.env.CLIENT_URL || "http://localhost:3000",
+  credentials: true,
 }));
 
 app.post(
@@ -177,8 +262,8 @@ app.post(
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
       const appointmentId = session.metadata?.appointmentId;
-console.log("FULL SESSION METADATA:", session.metadata);
-console.log("SESSION ID:", session.id);
+      console.log("FULL SESSION METADATA:", session.metadata);
+      console.log("SESSION ID:", session.id);
       console.log(
         "Payment completed for appointment:",
         appointmentId
@@ -191,22 +276,62 @@ console.log("SESSION ID:", session.id);
         });
       }
 
+      // Never mark as paid unless Stripe confirms the money was collected.
+      if (session.payment_status !== "paid") {
+        console.log(
+          "Session completed without payment; no update applied:",
+          session.id
+        );
+        return res.json({ received: true });
+      }
+
       try {
+        // One atomic update guarded by paymentStatus !== "paid":
+        // - a duplicate/replayed webhook matches nothing (idempotent,
+        //   no duplicate updates and no second appointment is created),
+        // - paymentStatus/paidAt only ever change here, on a
+        //   signature-verified event,
+        // - status only moves pending -> confirmed, so cancelled or
+        //   completed bookings are never resurrected and the booking
+        //   status/payment status never overwrite each other.
         const result = await appointmentsCollection.updateOne(
           {
             _id: new ObjectId(appointmentId),
+            paymentStatus: { $ne: "paid" },
           },
-          {
-            $set: {
-              status: "confirmed",
-              paymentStatus: "paid",
+          [
+            {
+              $set: {
+                paymentStatus: "paid",
+                paidAt: new Date(),
+                stripeSessionId: session.id,
+              },
             },
-          }
+            {
+              $set: {
+                status: {
+                  $cond: [
+                    { $eq: ["$status", "pending"] },
+                    "confirmed",
+                    { $ifNull: ["$status", "pending"] },
+                  ],
+                },
+              },
+            },
+          ]
         );
 
-        console.log("Appointment updated:", result.modifiedCount);
+        if (result.matchedCount === 0) {
+          console.log(
+            "Appointment already paid; duplicate webhook ignored:",
+            appointmentId
+          );
+        } else {
+          console.log("Appointment updated:", result.modifiedCount);
+        }
       } catch (error) {
         console.log("Appointment update failed:", error);
+        // Non-2xx so Stripe retries and the payment is not lost.
         return res.status(500).send({
           message: "Appointment update failed",
         });
@@ -222,21 +347,9 @@ console.log("CHECKOUT ROUTE ENTERED");
 
 app.post("/bookings/create-checkout-session", async (req, res) => {
   try {
-    const clientUrl =
-      process.env.CLIENT_URL ||
-      (process.env.NODE_ENV === "production"
-        ? undefined
-        : "http://localhost:3000");
+    const clientBaseUrl = resolveClientBaseUrl();
 
-    if (!clientUrl) {
-      return res.status(500).send({
-        message: "Checkout is not configured",
-      });
-    }
-
-    const clientBaseUrl = new URL(clientUrl);
-
-    if (!["http:", "https:"].includes(clientBaseUrl.protocol)) {
+    if (!clientBaseUrl) {
       return res.status(500).send({
         message: "Checkout is not configured",
       });
@@ -261,6 +374,10 @@ app.post("/bookings/create-checkout-session", async (req, res) => {
       });
     }
 
+    // Initial booking state: booking and payment are both unconfirmed.
+    // These two fields are independent and can only change through the
+    // booking flow and the verified Stripe webhook — never from a client
+    // request.
     const appointmentResult = await appointmentsCollection.insertOne({
       serviceId: payload.serviceId,
       serviceName: service.name,
@@ -274,6 +391,8 @@ app.post("/bookings/create-checkout-session", async (req, res) => {
       time: payload.time,
       status: "pending",
       paymentStatus: "unpaid",
+      paidAt: null,
+      refundStatus: "none",
       createdAt: new Date(),
     });
 
@@ -303,7 +422,7 @@ app.post("/bookings/create-checkout-session", async (req, res) => {
       ).toString(),
 
       cancel_url: new URL(
-        "/appointment/cancel",
+        `/appointment/cancel?appointmentId=${appointmentResult.insertedId}`,
         clientBaseUrl
       ).toString(),
 
@@ -330,6 +449,196 @@ app.post("/bookings/create-checkout-session", async (req, res) => {
 
     res.status(500).send({
       message: "Failed to create checkout session",
+    });
+  }
+});
+
+// Creates a Stripe checkout for an existing unpaid appointment ("Pay now").
+// It never marks the appointment as paid itself — only the verified Stripe
+// webhook can move paymentStatus to "paid".
+app.post("/bookings/:id/checkout", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid appointment ID",
+      });
+    }
+
+    const appointment = await appointmentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!appointment) {
+      return res.status(404).send({
+        message: "Appointment not found",
+      });
+    }
+
+    // A paid booking must never be sent back through a redirect that could
+    // later be mistaken for a failed/unpaid state.
+    if (appointment.paymentStatus === "paid") {
+      return res.status(409).send({
+        message: "This appointment is already paid.",
+      });
+    }
+
+    if (["cancelled", "completed"].includes(appointment.status)) {
+      return res.status(409).send({
+        message: "This appointment can no longer be paid for.",
+      });
+    }
+
+    const clientBaseUrl = resolveClientBaseUrl();
+
+    if (!clientBaseUrl) {
+      return res.status(500).send({
+        message: "Checkout is not configured",
+      });
+    }
+
+    let description = "";
+    if (ObjectId.isValid(appointment.serviceId)) {
+      const service = await servicesCollection.findOne({
+        _id: new ObjectId(appointment.serviceId),
+      });
+      description = service?.description ?? "";
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: appointment.serviceName,
+              description,
+            },
+            unit_amount: Math.round(Number(appointment.price) * 100),
+          },
+          quantity: 1,
+        },
+      ],
+      success_url: new URL(
+        `/appointment/success?appointmentId=${appointment._id}`,
+        clientBaseUrl
+      ).toString(),
+      cancel_url: new URL(
+        `/appointment/cancel?appointmentId=${appointment._id}`,
+        clientBaseUrl
+      ).toString(),
+      mode: "payment",
+      metadata: {
+        appointmentId: appointment._id.toString(),
+        userId: appointment.userId ?? "",
+      },
+    });
+
+    res.send({
+      success: true,
+      message: "Checkout session created",
+      data: {
+        redirectUrl: session.url,
+      },
+    });
+  } catch (error) {
+    console.error("Checkout retry error:", error);
+
+    res.status(500).send({
+      message: "Failed to create checkout session",
+    });
+  }
+});
+
+// Verified customer cancellation. The request must come from the booking
+// owner, the appointment must still be cancellable, and paymentStatus is
+// never changed here — a paid booking stays paid until a refund is
+// processed separately (tracked via refundStatus).
+app.post("/bookings/:id/cancel", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid appointment ID",
+      });
+    }
+
+    const appointment = await appointmentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!appointment) {
+      return res.status(404).send({
+        message: "Appointment not found",
+      });
+    }
+
+    const requesterId =
+      typeof req.body?.userId === "string" ? req.body.userId.trim() : "";
+
+    if (!requesterId) {
+      return res.status(401).send({
+        message: "Sign in to cancel this appointment.",
+      });
+    }
+
+    // Only the customer who booked the appointment may cancel it.
+    if (appointment.userId && appointment.userId !== requesterId) {
+      return res.status(403).send({
+        message: "You can only cancel your own appointments.",
+      });
+    }
+
+    // Idempotent: cancelling twice is not an error, but it is a no-op.
+    if (appointment.status === "cancelled") {
+      return res.send({
+        success: true,
+        modifiedCount: 0,
+        appointment,
+        message: "This appointment is already cancelled.",
+      });
+    }
+
+    // Eligibility check: only a pending/confirmed booking may be cancelled.
+    if (!["pending", "confirmed"].includes(appointment.status)) {
+      return res.status(409).send({
+        message: "This appointment can no longer be cancelled.",
+      });
+    }
+
+    // Atomic and guarded on the eligibility we just verified, so a
+    // concurrent webhook/admin update cannot be silently overwritten.
+    // status and paymentStatus stay independent: only `status` changes.
+    const result = await appointmentsCollection.updateOne(
+      { _id: new ObjectId(id), status: { $in: ["pending", "confirmed"] } },
+      { $set: { status: "cancelled", cancelledAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      const latest = await appointmentsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+      return res.status(409).send({
+        message: "This appointment is no longer cancellable.",
+        appointment: latest,
+      });
+    }
+
+    const updated = await appointmentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      success: true,
+      modifiedCount: result.modifiedCount,
+      appointment: updated,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to cancel appointment",
     });
   }
 });
@@ -379,11 +688,21 @@ app.get("/services/featured", async (req, res) => {
 
 app.post("/appointments", async (req, res) => {
   try {
-    const appointmentData = req.body;
+    // Clients may never choose booking/payment state: strip anything that
+    // belongs to the booking flow or the verified Stripe webhook.
+    const appointmentData = { ...(req.body ?? {}) };
+    delete appointmentData.status;
+    delete appointmentData.paymentStatus;
+    delete appointmentData.paidAt;
+    delete appointmentData.cancelledAt;
+    delete appointmentData.refundStatus;
 
     const result = await appointmentsCollection.insertOne({
       ...appointmentData,
       status: "pending",
+      paymentStatus: "unpaid",
+      paidAt: null,
+      refundStatus: "none",
       createdAt: new Date(),
     });
 
@@ -402,7 +721,7 @@ app.post("/appointments", async (req, res) => {
 app.patch("/appointments/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, paymentStatus } = req.body;
+    const { status, paymentStatus } = req.body ?? {};
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({
@@ -410,25 +729,68 @@ app.patch("/appointments/:id", async (req, res) => {
       });
     }
 
-    const update = {};
-
-    if (status) update.status = status;
-    if (paymentStatus) update.paymentStatus = paymentStatus;
-
-    if (Object.keys(update).length === 0) {
+    // paymentStatus is written exclusively by the verified Stripe webhook;
+    // no frontend/admin request may set it (especially not "paid").
+    if (paymentStatus !== undefined) {
       return res.status(400).send({
-        message: "Nothing to update",
+        message:
+          "Payment status cannot be changed here; it is only updated by the Stripe webhook.",
       });
     }
 
+    if (!status || !APPOINTMENT_STATUSES.includes(status)) {
+      return res.status(400).send({
+        message: "Choose a valid appointment status.",
+      });
+    }
+
+    const appointment = await appointmentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!appointment) {
+      return res.status(404).send({
+        message: "Appointment not found",
+      });
+    }
+
+    const currentStatus = appointment.status || "pending";
+
+    // Re-applying the current status is a harmless no-op.
+    if (currentStatus === status) {
+      return res.send({
+        success: true,
+        modifiedCount: 0,
+        message: "Appointment already has this status.",
+      });
+    }
+
+    const allowedNext = STATUS_TRANSITIONS[currentStatus];
+    if (allowedNext && !allowedNext.includes(status)) {
+      return res.status(409).send({
+        message: `An appointment cannot change from "${currentStatus}" to "${status}".`,
+      });
+    }
+
+    const update = { status };
+
+    if (status === "cancelled") {
+      // Booking state only: paymentStatus/paidAt are left untouched so a
+      // paid booking keeps its payment record (refunds use refundStatus).
+      update.cancelledAt = new Date();
+    }
+
+    // Guarded on the status we just read so a concurrent update cannot
+    // silently overwrite a different transition.
     const result = await appointmentsCollection.updateOne(
-      { _id: new ObjectId(id) },
+      { _id: new ObjectId(id), status: currentStatus },
       { $set: update }
     );
 
     if (result.matchedCount === 0) {
-      return res.status(404).send({
-        message: "Appointment not found",
+      return res.status(409).send({
+        message:
+          "Appointment status changed at the same time. Please refresh and try again.",
       });
     }
 
@@ -440,6 +802,37 @@ app.patch("/appointments/:id", async (req, res) => {
     console.log(error);
     res.status(500).send({
       message: "Failed to update appointment",
+    });
+  }
+});
+
+// Single-appointment lookup used by the success/cancel pages to verify the
+// real MongoDB state instead of assuming it from the Stripe redirect.
+app.get("/appointments/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid appointment ID",
+      });
+    }
+
+    const appointment = await appointmentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!appointment) {
+      return res.status(404).send({
+        message: "Appointment not found",
+      });
+    }
+
+    res.send(appointment);
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to fetch appointment",
     });
   }
 });
@@ -554,7 +947,7 @@ app.post("/reports", async (req, res) => {
   }
 });
 
-app.post("/services", async (req, res) => {
+app.post("/services",requireAdmin, async (req, res) => {
   try {
     const serviceData = req.body;
 
@@ -608,6 +1001,125 @@ app.post("/services", async (req, res) => {
     });
   }
 });
+
+app.get("/admin/services", requireAdmin, async (req, res) => {
+  try {
+    const services = await servicesCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).send(services);
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to fetch all services",
+    });
+  }
+});
+
+app.patch("/services/:id", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid service ID",
+      });
+    }
+
+    const {
+      name,
+      category,
+      price,
+      duration,
+      description,
+      image,
+      featured,
+      status,
+    } = req.body;
+
+    if (
+      !name ||
+      !category ||
+      price === undefined ||
+      !duration ||
+      !description ||
+      !image
+    ) {
+      return res.status(400).send({
+        message: "Please provide all required service information.",
+      });
+    }
+
+    const updatedService = {
+      name,
+      category,
+      price: Number(price),
+      duration: Number(duration),
+      description,
+      image,
+      featured: featured === true,
+      status: status || "active",
+      updatedAt: new Date(),
+    };
+
+    const result = await servicesCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updatedService }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({
+        message: "Service not found",
+      });
+    }
+
+    res.status(200).send({
+      success: true,
+      message: "Service updated successfully!",
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to update service",
+    });
+  }
+});
+
+
+app.delete("/services/:id",  requireAdmin,async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid service ID",
+      });
+    }
+
+    const result = await servicesCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({
+        message: "Service not found",
+      });
+    }
+
+    res.status(200).send({
+      success: true,
+      message: "Service deleted successfully!",
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to delete service",
+    });
+  }
+});
+
 
 app.post("/offers", async (req, res) => {
   try {
