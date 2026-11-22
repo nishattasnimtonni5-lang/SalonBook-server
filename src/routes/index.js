@@ -1,7 +1,7 @@
 import { Router } from "express";
 import appointmentRouter from "./appointments/index.js";
 
-// All API routes live under /api (see app.js).
+
 
 const router = Router();
 

@@ -1060,20 +1060,30 @@ app.get("/appointments/:id",   requireActiveUser,async (req, res) => {
   }
 });
 
-app.get("/appointments",requireActiveUser, async (req, res) => {
+app.get("/appointments", async (req, res) => {
   try {
-   const query =
-  req.user.role === "admin"
-    ? {}
-    : { userId: req.user.id };
+    // Allow internal Next.js server calls via shared secret (admin panel)
+    const internalSecret = process.env.INTERNAL_API_SECRET;
+    if (internalSecret && req.headers["x-internal-secret"] === internalSecret) {
+      const result = await appointmentsCollection.find({}).toArray();
+      return res.send(result);
+    }
 
-const result = await appointmentsCollection.find(query).toArray();
+    // Otherwise require an active user session
+    const session = await auth.api.getSession({ headers: fromNodeHeaders(req.headers) });
+    if (!session?.user) {
+      return res.status(401).send({ message: "Please login first." });
+    }
+    const user = await usersCollection.findOne({ _id: new ObjectId(session.user.id) });
+    if (!user) return res.status(401).send({ message: "User not found." });
+    if (user.isBlocked) return res.status(403).send({ message: "Your account has been blocked." });
+
+    const query = session.user.role === "admin" ? {} : { userId: session.user.id };
+    const result = await appointmentsCollection.find(query).toArray();
     res.send(result);
   } catch (error) {
     console.log(error);
-    res.status(500).send({
-      message: "Failed to fetch appointments",
-    });
+    res.status(500).send({ message: "Failed to fetch appointments" });
   }
 });
 
