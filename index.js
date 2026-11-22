@@ -33,6 +33,7 @@ const servicesCollection = database.collection("services");
 const appointmentsCollection = database.collection("appointments");
 const reportsCollection = database.collection("reports");
 const offersCollection = database.collection("offers");
+const transactionsCollection = database.collection("transactions");
 
 const auth = betterAuth({
   database: mongodbAdapter(database, {
@@ -95,9 +96,18 @@ const requireActiveUser = async (req, res, next) => {
       });
     }
 
-    const user = await usersCollection.findOne({
-      id: session.user.id,
-    });
+    if (!session) {
+  return res.status(401).send({
+    message: "Please login first.",
+  });
+}
+
+console.log("Logged in user ID:", session.user.id);
+console.log("Logged in user:", session.user);
+    
+      const user = await usersCollection.findOne({
+  _id: new ObjectId(session.user.id),
+});
 
     if (!user) {
       return res.status(401).send({
@@ -366,6 +376,37 @@ app.post(
         } else {
           console.log("Appointment updated:", result.modifiedCount);
         }
+
+        const updatedAppointment = await appointmentsCollection.findOne({
+          _id: new ObjectId(appointmentId),
+        });
+
+        if (updatedAppointment) {
+          const transactionDoc = {
+            appointmentId: updatedAppointment._id,
+            userId: updatedAppointment.userId,
+            customerName: updatedAppointment.customerName || session.customer_details?.name || "Customer",
+            customerEmail: updatedAppointment.customerEmail || session.customer_details?.email || "",
+            serviceId: updatedAppointment.serviceId,
+            serviceName: updatedAppointment.serviceName,
+            serviceImage: updatedAppointment.serviceImage,
+            appointmentDate: updatedAppointment.date,
+            appointmentTime: updatedAppointment.time,
+            paymentAmount: session.amount_total ? session.amount_total / 100 : Number(updatedAppointment.price),
+            currency: (session.currency || "usd").toUpperCase(),
+            stripeSessionId: session.id,
+            paymentStatus: "paid",
+            transactionDate: updatedAppointment.paidAt || new Date(),
+            createdAt: new Date(),
+          };
+
+          await transactionsCollection.updateOne(
+            { stripeSessionId: session.id },
+            { $set: transactionDoc },
+            { upsert: true }
+          );
+          console.log("Transaction saved in transactions collection for:", session.id);
+        }
       } catch (error) {
         console.log("Appointment update failed:", error);
         // Non-2xx so Stripe retries and the payment is not lost.
@@ -454,7 +495,7 @@ customerEmail: req.user.email,
       ],
 
       success_url: new URL(
-        `/appointment/success?appointmentId=${appointmentResult.insertedId}`,
+        `/appointment/success?appointmentId=${appointmentResult.insertedId}&session_id={CHECKOUT_SESSION_ID}`,
         clientBaseUrl
       ).toString(),
 
@@ -563,7 +604,7 @@ app.post("/bookings/:id/checkout", requireActiveUser, async (req, res) => {
         },
       ],
       success_url: new URL(
-        `/appointment/success?appointmentId=${appointment._id}`,
+        `/appointment/success?appointmentId=${appointment._id}&session_id={CHECKOUT_SESSION_ID}`,
         clientBaseUrl
       ).toString(),
       cancel_url: new URL(
@@ -690,6 +731,140 @@ app.post("/bookings/:id/cancel", requireActiveUser, async (req, res) => {
   }
 });
 
+// Verified payment confirmation & transaction retrieval:
+// Verifies Stripe checkout session, updates appointment paymentStatus to "paid",
+// stores transaction in the `transactions` collection, and returns the transaction details.
+app.get("/bookings/verify-session", async (req, res) => {
+  try {
+    const { session_id, appointmentId } = req.query;
+
+    if (!session_id && !appointmentId) {
+      return res.status(400).send({ message: "session_id or appointmentId is required" });
+    }
+
+    let session = null;
+    if (session_id) {
+      try {
+        session = await stripe.checkout.sessions.retrieve(session_id);
+      } catch (stripeErr) {
+        console.log("Could not retrieve Stripe session directly:", stripeErr.message);
+      }
+    }
+
+    const targetAppointmentId =
+      session?.metadata?.appointmentId || appointmentId;
+
+    if (!targetAppointmentId || !ObjectId.isValid(targetAppointmentId)) {
+      return res.status(400).send({ message: "Invalid appointment ID" });
+    }
+
+    let appointment = await appointmentsCollection.findOne({
+      _id: new ObjectId(targetAppointmentId),
+    });
+
+    if (!appointment) {
+      return res.status(404).send({ message: "Appointment not found" });
+    }
+
+    const isSessionPaid = session?.payment_status === "paid";
+    const isAlreadyPaid = appointment.paymentStatus === "paid";
+
+    if (isSessionPaid || isAlreadyPaid) {
+      if (!isAlreadyPaid) {
+        await appointmentsCollection.updateOne(
+          { _id: new ObjectId(targetAppointmentId) },
+          {
+            $set: {
+              paymentStatus: "paid",
+              paidAt: new Date(),
+              stripeSessionId: session?.id || appointment.stripeSessionId || null,
+              status: appointment.status === "pending" ? "confirmed" : appointment.status,
+            },
+          }
+        );
+        appointment = await appointmentsCollection.findOne({
+          _id: new ObjectId(targetAppointmentId),
+        });
+      }
+
+      const stripeSessionId = session?.id || appointment.stripeSessionId || `ref_${appointment._id}`;
+      const paymentAmount = session?.amount_total
+        ? session.amount_total / 100
+        : Number(appointment.price);
+
+      const transactionDoc = {
+        appointmentId: appointment._id,
+        userId: appointment.userId,
+        customerName:
+          appointment.customerName ||
+          session?.customer_details?.name ||
+          "Customer",
+        customerEmail:
+          appointment.customerEmail ||
+          session?.customer_details?.email ||
+          "",
+        serviceId: appointment.serviceId,
+        serviceName: appointment.serviceName,
+        serviceImage: appointment.serviceImage,
+        appointmentDate: appointment.date,
+        appointmentTime: appointment.time,
+        paymentAmount,
+        currency: (session?.currency || "usd").toUpperCase(),
+        stripeSessionId,
+        paymentStatus: "paid",
+        transactionDate: appointment.paidAt || new Date(),
+        createdAt: new Date(),
+      };
+
+      await transactionsCollection.updateOne(
+        { appointmentId: appointment._id },
+        { $set: transactionDoc },
+        { upsert: true }
+      );
+
+      const transaction = await transactionsCollection.findOne({
+        appointmentId: appointment._id,
+      });
+
+      return res.send({
+        success: true,
+        verified: true,
+        appointment,
+        transaction,
+      });
+    }
+
+    res.send({
+      success: true,
+      verified: false,
+      appointment,
+      transaction: null,
+    });
+  } catch (error) {
+    console.error("Session verification error:", error);
+    res.status(500).send({ message: "Failed to verify session" });
+  }
+});
+
+app.get("/transactions/:appointmentId", async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+    if (!ObjectId.isValid(appointmentId)) {
+      return res.status(400).send({ message: "Invalid appointment ID" });
+    }
+    const transaction = await transactionsCollection.findOne({
+      appointmentId: new ObjectId(appointmentId),
+    });
+    if (!transaction) {
+      return res.status(404).send({ message: "Transaction not found" });
+    }
+    res.send(transaction);
+  } catch (error) {
+    console.error("Fetch transaction error:", error);
+    res.status(500).send({ message: "Failed to fetch transaction" });
+  }
+});
+
 
 app.get("/", (req, res) => {
   res.send({
@@ -745,13 +920,14 @@ app.post("/appointments",requireActiveUser, async (req, res) => {
     delete appointmentData.refundStatus;
 
     const result = await appointmentsCollection.insertOne({
-      ...appointmentData,
-      status: "pending",
-      paymentStatus: "unpaid",
-      paidAt: null,
-      refundStatus: "none",
-      createdAt: new Date(),
-    });
+  ...appointmentData,
+  userId: req.user.id,
+  status: "pending",
+  paymentStatus: "unpaid",
+  paidAt: null,
+  refundStatus: "none",
+  createdAt: new Date(),
+});
 
     res.send({
       success: true,
@@ -765,7 +941,7 @@ app.post("/appointments",requireActiveUser, async (req, res) => {
   }
 });
 
-app.patch("/appointments/:id", async (req, res) => {
+app.patch("/appointments/:id",requireAdmin,  async (req, res) => {
   try {
     const { id } = req.params;
     const { status, paymentStatus } = req.body ?? {};
@@ -855,7 +1031,7 @@ app.patch("/appointments/:id", async (req, res) => {
 
 // Single-appointment lookup used by the success/cancel pages to verify the
 // real MongoDB state instead of assuming it from the Stripe redirect.
-app.get("/appointments/:id",  requireAdmin,async (req, res) => {
+app.get("/appointments/:id",   requireActiveUser,async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -884,9 +1060,14 @@ app.get("/appointments/:id",  requireAdmin,async (req, res) => {
   }
 });
 
-app.get("/appointments", requireAdmin, async (req, res) => {
+app.get("/appointments",requireActiveUser, async (req, res) => {
   try {
-    const result = await appointmentsCollection.find().toArray();
+   const query =
+  req.user.role === "admin"
+    ? {}
+    : { userId: req.user.id };
+
+const result = await appointmentsCollection.find(query).toArray();
     res.send(result);
   } catch (error) {
     console.log(error);
