@@ -28,7 +28,7 @@ export async function connectToMongoDB() {
 
 const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("SalonBook");
-
+const usersCollection = database.collection("user");
 const servicesCollection = database.collection("services");
 const appointmentsCollection = database.collection("appointments");
 const reportsCollection = database.collection("reports");
@@ -83,6 +83,43 @@ const requireAdmin = async (req, res, next) => {
 };
 
 
+const requireActiveUser = async (req, res, next) => {
+  try {
+    const session = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+
+    if (!session) {
+      return res.status(401).send({
+        message: "Please login first.",
+      });
+    }
+
+    const user = await usersCollection.findOne({
+      id: session.user.id,
+    });
+
+    if (!user) {
+      return res.status(401).send({
+        message: "User not found.",
+      });
+    }
+
+    if (user.isBlocked === true) {
+      return res.status(403).send({
+        message: "Your account has been blocked.",
+      });
+    }
+
+    req.user = session.user;
+    next();
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Authentication failed.",
+    });
+  }
+};
 
 const REPORT_CATEGORIES = [
   "Service Quality",
@@ -345,7 +382,7 @@ app.post(
 app.use(express.json());
 console.log("CHECKOUT ROUTE ENTERED");
 
-app.post("/bookings/create-checkout-session", async (req, res) => {
+app.post("/bookings/create-checkout-session",requireActiveUser, async (req, res) => {
   try {
     const clientBaseUrl = resolveClientBaseUrl();
 
@@ -384,9 +421,9 @@ app.post("/bookings/create-checkout-session", async (req, res) => {
       serviceImage: service.image,
       price: service.price,
       duration: service.duration,
-      userId: payload.userId,
-      customerName: payload.customerName,
-      customerEmail: payload.customerEmail,
+      userId: req.user.id,
+customerName: req.user.name,
+customerEmail: req.user.email,
       date: payload.date,
       time: payload.time,
       status: "pending",
@@ -430,7 +467,7 @@ app.post("/bookings/create-checkout-session", async (req, res) => {
 
       metadata: {
         appointmentId: appointmentResult.insertedId.toString(),
-        userId: payload.userId,
+        userId: req.user.id,
       },
     });
 
@@ -456,7 +493,7 @@ app.post("/bookings/create-checkout-session", async (req, res) => {
 // Creates a Stripe checkout for an existing unpaid appointment ("Pay now").
 // It never marks the appointment as paid itself — only the verified Stripe
 // webhook can move paymentStatus to "paid".
-app.post("/bookings/:id/checkout", async (req, res) => {
+app.post("/bookings/:id/checkout", requireActiveUser, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -474,6 +511,11 @@ app.post("/bookings/:id/checkout", async (req, res) => {
       return res.status(404).send({
         message: "Appointment not found",
       });
+      if (appointment.userId !== req.user.id) {
+  return res.status(403).send({
+    message: "You are not allowed to access this booking.",
+  });
+}
     }
 
     // A paid booking must never be sent back through a redirect that could
@@ -555,7 +597,7 @@ app.post("/bookings/:id/checkout", async (req, res) => {
 // owner, the appointment must still be cancellable, and paymentStatus is
 // never changed here — a paid booking stays paid until a refund is
 // processed separately (tracked via refundStatus).
-app.post("/bookings/:id/cancel", async (req, res) => {
+app.post("/bookings/:id/cancel", requireActiveUser, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -573,6 +615,11 @@ app.post("/bookings/:id/cancel", async (req, res) => {
       return res.status(404).send({
         message: "Appointment not found",
       });
+      if (appointment.userId !== req.user.id) {
+  return res.status(403).send({
+    message: "You are not allowed to cancel this booking.",
+  });
+}
     }
 
     const requesterId =
@@ -686,7 +733,7 @@ app.get("/services/featured", async (req, res) => {
   }
 });
 
-app.post("/appointments", async (req, res) => {
+app.post("/appointments",requireActiveUser, async (req, res) => {
   try {
     // Clients may never choose booking/payment state: strip anything that
     // belongs to the booking flow or the verified Stripe webhook.
@@ -808,7 +855,7 @@ app.patch("/appointments/:id", async (req, res) => {
 
 // Single-appointment lookup used by the success/cancel pages to verify the
 // real MongoDB state instead of assuming it from the Stripe redirect.
-app.get("/appointments/:id", async (req, res) => {
+app.get("/appointments/:id",  requireAdmin,async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -837,7 +884,7 @@ app.get("/appointments/:id", async (req, res) => {
   }
 });
 
-app.get("/appointments", async (req, res) => {
+app.get("/appointments", requireAdmin, async (req, res) => {
   try {
     const result = await appointmentsCollection.find().toArray();
     res.send(result);
@@ -1221,6 +1268,107 @@ app.get("/offers", async (req, res) => {
     console.log(error);
     res.status(500).send({
       message: "Failed to fetch offers.",
+    });
+  }
+});
+app.get("/admin/users", requireAdmin, async (req, res) => {
+  try {
+    const users = await usersCollection
+      .find(
+        { role: { $ne: "admin" } },
+        {
+          projection: {
+            _id: 0,
+            id: 1,
+            name: 1,
+            email: 1,
+            image: 1,
+            role: 1,
+            isBlocked: 1,
+            createdAt: 1,
+          },
+        }
+      )
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).send(users);
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to fetch users.",
+    });
+  }
+});
+
+app.patch("/admin/users/:id/block", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const user = await usersCollection.findOne({ id });
+
+    if (!user) {
+      return res.status(404).send({
+        message: "User not found.",
+      });
+    }
+
+    if (user.role === "admin" || user.id === req.user.id) {
+      return res.status(403).send({
+        message: "Admin account cannot be blocked.",
+      });
+    }
+
+    await usersCollection.updateOne(
+      { id },
+      {
+        $set: {
+          isBlocked: true,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.status(200).send({
+      success: true,
+      message: "User blocked successfully.",
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to block user.",
+    });
+  }
+});
+
+app.patch("/admin/users/:id/unblock", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await usersCollection.updateOne(
+      { id, role: { $ne: "admin" } },
+      {
+        $set: {
+          isBlocked: false,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({
+        message: "Customer not found.",
+      });
+    }
+
+    res.status(200).send({
+      success: true,
+      message: "User unblocked successfully.",
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to unblock user.",
     });
   }
 });

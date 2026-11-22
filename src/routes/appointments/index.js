@@ -26,7 +26,7 @@ router.post("/create-checkout-session", async (req, res) => {
       serviceImage: service.image,
       price: service.price,
       duration: service.duration,
-      userId: payload.userId,
+      userId: req.user.id,
       customerEmail: payload.customerEmail,
       date: payload.date,
       time: payload.time,
@@ -55,7 +55,7 @@ console.log("BEFORE STRIPE SESSION");
       mode: "payment",
       metadata: {
         appointmentId: appointmentResult.insertedId.toString(),
-        userId: payload.userId,
+        userId: req.user.id,
       },
     });
 

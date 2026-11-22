@@ -21,3 +21,4 @@ export const appointmentCollection = db.collection("appointments");
 export async function closeDB() {
   await client.close();
 }
+export { client };
