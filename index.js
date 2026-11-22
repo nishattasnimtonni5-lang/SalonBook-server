@@ -6,10 +6,22 @@ import Stripe from "stripe";
 import "dotenv/config";
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
-import { fromNodeHeaders } from "better-auth/node";
+import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
+import jwt from "jsonwebtoken";
 
 const app = express();
 const PORT = 8000;
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const isProduction = process.env.NODE_ENV === "production";
+
+const cookieOptions = {
+  httpOnly: true,
+  secure: isProduction,
+  sameSite: "lax",
+  maxAge: 15 * 60 * 1000,
+  path: "/",
+};
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -53,6 +65,14 @@ const auth = betterAuth({
 
   secret: process.env.BETTER_AUTH_SECRET,
   baseURL: process.env.BETTER_AUTH_URL,
+  trustedOrigins: ["http://localhost:3000"],
+  emailAndPassword: { enabled: true },
+  socialProviders: {
+    google: {
+      clientId: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    },
+  },
 });
 
 const requireAdmin = async (req, res, next) => {
@@ -130,6 +150,54 @@ console.log("Logged in user:", session.user);
     });
   }
 };
+
+const verifyJWT = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  let token = null;
+
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    token = authHeader.split(" ")[1];
+  } else {
+    const cookieHeader = req.headers.cookie;
+    if (cookieHeader) {
+      const cookies = cookieHeader.split(";").map((c) => c.trim().split("="));
+      const found = cookies.find(([name]) => name === "token");
+      if (found) token = found[1];
+    }
+  }
+
+  if (!token) {
+    return res.status(401).send({ message: "Missing or invalid authorization" });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      algorithms: ["HS256"],
+      issuer: "salonbook",
+      audience: "salonbook-api",
+    });
+
+    req.user = {
+      id: decoded.userId,
+      role: decoded.role,
+      email: decoded.email,
+    };
+
+    next();
+  } catch (error) {
+    return res.status(401).send({ message: "Invalid or expired token" });
+  }
+};
+
+const requireRole = (...roles) => (req, res, next) => {
+  if (!req.user || !roles.includes(req.user.role)) {
+    return res.status(403).send({ message: "Forbidden: insufficient role" });
+  }
+  next();
+};
+
+const requireAdminJWT = (req, res, next) => requireRole("admin")(req, res, next);
+const requireCustomerJWT = (req, res, next) => requireRole("customer")(req, res, next);
 
 const REPORT_CATEGORIES = [
   "Service Quality",
@@ -420,8 +488,56 @@ app.post(
   }
 );
 
+app.all("/api/auth/*splat", toNodeHandler(auth));
 app.use(express.json());
 console.log("CHECKOUT ROUTE ENTERED");
+
+app.post("/auth/token", async (req, res) => {
+  try {
+    const session = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+
+    if (!session || !session.user) {
+      return res.status(401).send({ message: "Unauthorized. Please login first." });
+    }
+
+    const token = jwt.sign(
+      {
+        userId: session.user.id,
+        role: session.user.role,
+        email: session.user.email,
+      },
+      JWT_SECRET,
+      {
+        algorithm: "HS256",
+        expiresIn: "15m",
+        issuer: "salonbook",
+        audience: "salonbook-api",
+      }
+    );
+
+    res.cookie("token", token, cookieOptions);
+
+    return res.send({
+      success: true,
+      message: "JWT issued",
+      data: { token },
+    });
+  } catch (error) {
+    console.error("JWT issuance error:", error);
+    return res.status(500).send({ message: "Failed to issue token" });
+  }
+});
+
+app.post("/auth/logout", async (req, res) => {
+  res.clearCookie("token", { path: "/" });
+  return res.send({ success: true, message: "Logged out" });
+});
+
+app.get("/auth/test-jwt", verifyJWT, async (req, res) => {
+  return res.send({ success: true, user: req.user });
+});
 
 app.post("/bookings/create-checkout-session",requireActiveUser, async (req, res) => {
   try {
