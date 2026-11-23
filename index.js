@@ -17,8 +17,9 @@ const isProduction = process.env.NODE_ENV === "production";
 
 const cookieOptions = {
   httpOnly: true,
-  secure: isProduction,
-  sameSite: "lax",
+  // Cross-site API calls from the frontend domain need SameSite=None.
+  secure: true,
+  sameSite: "none",
   maxAge: 15 * 60 * 1000,
   path: "/",
 };
@@ -74,6 +75,13 @@ const auth = betterAuth({
   // State is still verified against the DB verification record + PKCE.
   account: {
     skipStateCookieCheck: true,
+  },
+  // Let the session cookie be sent on cross-site API calls
+  // (frontend and backend are on different domains).
+  advanced: {
+    cookie: {
+      sameSite: "none",
+    },
   },
   emailAndPassword: { enabled: true },
   socialProviders: {
