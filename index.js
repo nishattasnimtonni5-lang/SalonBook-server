@@ -69,6 +69,12 @@ const auth = betterAuth({
     "http://localhost:3000",
     process.env.CLIENT_URL || "https://salon-book-a-06.vercel.app",
   ],
+  // Frontend and backend are on different domains, so the OAuth state
+  // cookie set on a cross-site fetch is partitioned/blocked by browsers.
+  // State is still verified against the DB verification record + PKCE.
+  account: {
+    skipStateCookieCheck: true,
+  },
   emailAndPassword: { enabled: true },
   socialProviders: {
     google: {
