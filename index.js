@@ -1680,6 +1680,4 @@ app.patch("/admin/users/:id/unblock", requireAdmin, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log("SERVER IS RUNNING GOOD");
-});
+export default app;
