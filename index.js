@@ -65,7 +65,10 @@ const auth = betterAuth({
 
   secret: process.env.BETTER_AUTH_SECRET,
   baseURL: process.env.BETTER_AUTH_URL,
-  trustedOrigins: ["http://localhost:3000"],
+  trustedOrigins: [
+    "http://localhost:3000",
+    process.env.CLIENT_URL || "https://salon-book-a-06.vercel.app",
+  ],
   emailAndPassword: { enabled: true },
   socialProviders: {
     google: {
