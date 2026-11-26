@@ -78,9 +78,12 @@ const auth = betterAuth({
   },
   // Let the session cookie be sent on cross-site API calls
   // (frontend and backend are on different domains).
+  // NOTE: this better-auth version reads overrides from
+  // advanced.defaultCookieAttributes, not advanced.cookie.
   advanced: {
-    cookie: {
+    defaultCookieAttributes: {
       sameSite: "none",
+      secure: true,
     },
   },
   emailAndPassword: { enabled: true },
