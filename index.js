@@ -1780,6 +1780,48 @@ app.delete("/offers/:id", async (req, res) => {
   }
 });
 
+app.get("/users/me/status", async (req, res) => {
+  try {
+    const session = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+
+    if (!session) {
+      return res.status(401).send({
+        message: "Please sign in first.",
+      });
+    }
+
+    const userId = session.user.id;
+
+    if (!ObjectId.isValid(userId)) {
+      return res.status(400).send({
+        message: "Invalid user ID",
+      });
+    }
+
+    const user = await usersCollection.findOne({
+      _id: new ObjectId(userId),
+    });
+
+    if (!user) {
+      return res.status(404).send({
+        message: "User not found",
+      });
+    }
+
+    res.status(200).send({
+      isBlocked: user.isBlocked === true,
+      role: user.role,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({
+      message: "Failed to check user status",
+    });
+  }
+});
+
 app.get("/admin/users", requireAdmin, async (req, res) => {
   try {
     const users = await usersCollection
