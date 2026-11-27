@@ -224,6 +224,9 @@ const REPORT_CATEGORIES = [
   "Staff Behaviour",
   "Payment Issue",
   "appointment Issue",
+  // The client form (src/lib/reports.ts) offers "Booking Issue"; accept it
+  // too so that choice doesn't fail server-side validation with a 400.
+  "Booking Issue",
   "Inappropriate Behaviour / Abuse",
   "Other",
 ];
@@ -364,7 +367,12 @@ async function sendAdminReportEmail(report) {
 }
 
 app.use(cors({
-  origin: process.env.CLIENT_URL || "http://localhost:3000",
+  // Allow both the deployed client and local dev — matches BetterAuth's
+  // trustedOrigins below so cross-origin sign-in works from either origin.
+  origin: [
+    process.env.CLIENT_URL || "https://salon-book-a-06.vercel.app",
+    "http://localhost:3000",
+  ],
   credentials: true,
 }));
 
@@ -1321,6 +1329,65 @@ app.post("/reports", async (req, res) => {
   }
 });
 
+// List every submitted report for the admin dashboard. Reached through the
+// Next.js /api/admin/reports proxy, which already verified the admin session;
+// the shared internal secret proves the call comes from our own server.
+app.get("/reports", async (req, res) => {
+  try {
+    const secret = process.env.INTERNAL_API_SECRET;
+    if (!secret || req.headers["x-internal-secret"] !== secret) {
+      return res.status(401).send({ message: "Unauthorized" });
+    }
+
+    const reports = await reportsCollection
+      .find({})
+      .sort({ submittedAt: -1 })
+      .toArray();
+    res.status(200).send(reports);
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Failed to fetch reports" });
+  }
+});
+
+// Move a report between pending / reviewed / resolved (admin dashboard).
+app.patch("/reports/:id", async (req, res) => {
+  try {
+    const secret = process.env.INTERNAL_API_SECRET;
+    if (!secret || req.headers["x-internal-secret"] !== secret) {
+      return res.status(401).send({ message: "Unauthorized" });
+    }
+
+    const { status } = req.body ?? {};
+    const normalized = typeof status === "string" ? status.trim().toLowerCase() : "";
+    if (!["pending", "reviewed", "resolved"].includes(normalized)) {
+      return res.status(400).send({ message: "Choose a valid report status." });
+    }
+
+    let id;
+    try {
+      id = new ObjectId(req.params.id);
+    } catch {
+      return res.status(404).send({ message: "Report not found." });
+    }
+
+    // Existing documents store Title-case statuses ("Pending"); keep that.
+    const titleCase = normalized.charAt(0).toUpperCase() + normalized.slice(1);
+    const result = await reportsCollection.updateOne(
+      { _id: id },
+      { $set: { status: titleCase, updatedAt: new Date() } }
+    );
+    if (!result.matchedCount) {
+      return res.status(404).send({ message: "Report not found." });
+    }
+
+    res.status(200).send({ success: true, message: "Report updated." });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Failed to update report" });
+  }
+});
+
 app.post("/services",requireAdmin, async (req, res) => {
   try {
     const serviceData = req.body;
@@ -1512,12 +1579,9 @@ app.post("/offers", async (req, res) => {
 
     if (
       !title ||
-      !image ||
       !description ||
       !discountType ||
       discountValue === undefined ||
-      !category ||
-      !startDate ||
       !expiryDate
     ) {
       return res.status(400).send({
@@ -1554,17 +1618,36 @@ app.post("/offers", async (req, res) => {
       });
     }
 
+    // The admin form (via Next.js /api/admin/offers) sends couponCode /
+    // applicableService / terms / minBookingAmount instead of promoCode /
+    // category / startDate / image. Store both shapes so every reader —
+    // filterValidOffers, manage-offers, the customer browser — finds its
+    // fields, with defaults for whatever the caller didn't send.
+    const applicableService =
+      typeof req.body.applicableService === "string"
+        ? req.body.applicableService.trim()
+        : "";
+    const couponCode =
+      typeof req.body.couponCode === "string" ? req.body.couponCode.trim() : "";
+    const terms = typeof req.body.terms === "string" ? req.body.terms : "";
+
     const newOffer = {
       title,
-      image,
+      image: typeof image === "string" ? image : "",
       description,
       discountType,
       discountValue: value,
-      category,
-      startDate,
+      category: category || applicableService || "All services",
+      startDate: startDate || new Date().toISOString().slice(0, 10),
       expiryDate,
-      promoCode: promoCode || "",
+      promoCode: promoCode || couponCode || "",
       status: offerStatus,
+      ...(applicableService ? { applicableService } : {}),
+      ...(couponCode ? { couponCode } : {}),
+      ...(terms ? { terms } : {}),
+      ...(req.body.minBookingAmount !== undefined
+        ? { minBookingAmount: Number(req.body.minBookingAmount) || 0 }
+        : {}),
       createdAt: new Date(),
     };
 
@@ -1598,33 +1681,126 @@ app.get("/offers", async (req, res) => {
     });
   }
 });
+
+// Update an offer from the admin dashboard: either a full-form save or an
+// { active } toggle. Reached through Next's /api/admin/offers/[id] proxy,
+// which verified the admin session; the shared internal secret proves the
+// call comes from our own server.
+app.patch("/offers/:id", async (req, res) => {
+  try {
+    const secret = process.env.INTERNAL_API_SECRET;
+    if (!secret || req.headers["x-internal-secret"] !== secret) {
+      return res.status(401).send({ message: "Unauthorized" });
+    }
+
+    let id;
+    try {
+      id = new ObjectId(req.params.id);
+    } catch {
+      return res.status(404).send({ message: "Offer not found." });
+    }
+
+    const body = req.body ?? {};
+    const update = {};
+
+    for (const key of [
+      "title",
+      "description",
+      "applicableService",
+      "couponCode",
+      "expiryDate",
+      "terms",
+    ]) {
+      if (typeof body[key] === "string") update[key] = body[key].trim();
+    }
+    if (body.discountType === "percentage" || body.discountType === "fixed") {
+      update.discountType = body.discountType;
+    }
+    if (body.discountValue !== undefined) {
+      const value = Number(body.discountValue);
+      if (!Number.isFinite(value) || value <= 0) {
+        return res.status(400).send({ message: "Invalid discount value." });
+      }
+      update.discountValue = value;
+    }
+    if (body.minBookingAmount !== undefined) {
+      const value = Number(body.minBookingAmount);
+      update.minBookingAmount = Number.isFinite(value) && value >= 0 ? value : 0;
+    }
+    // Keep the legacy field names in sync for readers that expect them.
+    if (update.couponCode !== undefined) update.promoCode = update.couponCode;
+    if (update.applicableService) update.category = update.applicableService;
+    if (typeof body.active === "boolean") {
+      update.active = body.active;
+      update.status = body.active ? "active" : "inactive";
+    }
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).send({ message: "Nothing to update." });
+    }
+
+    const result = await offersCollection.updateOne(
+      { _id: id },
+      { $set: update }
+    );
+    if (!result.matchedCount) {
+      return res.status(404).send({ message: "Offer not found." });
+    }
+
+    res.status(200).send({ success: true, message: "Offer updated." });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Failed to update offer" });
+  }
+});
+
+app.delete("/offers/:id", async (req, res) => {
+  try {
+    const secret = process.env.INTERNAL_API_SECRET;
+    if (!secret || req.headers["x-internal-secret"] !== secret) {
+      return res.status(401).send({ message: "Unauthorized" });
+    }
+
+    let id;
+    try {
+      id = new ObjectId(req.params.id);
+    } catch {
+      return res.status(404).send({ message: "Offer not found." });
+    }
+
+    const result = await offersCollection.deleteOne({ _id: id });
+    if (!result.deletedCount) {
+      return res.status(404).send({ message: "Offer not found." });
+    }
+
+    res.status(200).send({ success: true, message: "Offer deleted." });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Failed to delete offer" });
+  }
+});
+
 app.get("/admin/users", requireAdmin, async (req, res) => {
   try {
     const users = await usersCollection
-      .find(
-        { role: { $ne: "admin" } },
-        {
-          projection: {
-            _id: 0,
-            id: 1,
-            name: 1,
-            email: 1,
-            image: 1,
-            role: 1,
-            isBlocked: 1,
-            createdAt: 1,
-          },
-        }
-      )
+      .find({ role: { $ne: "admin" } })
       .sort({ createdAt: -1 })
       .toArray();
 
-    res.status(200).send(users);
+    const formattedUsers = users.map((user) => ({
+      id: user._id.toString(),
+      name: user.name,
+      email: user.email,
+      image: user.image,
+      role: user.role,
+      isBlocked: user.isBlocked,
+      createdAt: user.createdAt,
+    }));
+
+    res.status(200).send(formattedUsers);
   } catch (error) {
     console.log(error);
-    res.status(500).send({
-      message: "Failed to fetch users.",
-    });
+    res.status(500).send({ message: "Failed to fetch users" });
   }
 });
 
@@ -1632,22 +1808,27 @@ app.patch("/admin/users/:id/block", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const user = await usersCollection.findOne({ id });
-
-    if (!user) {
-      return res.status(404).send({
-        message: "User not found.",
-      });
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid user ID" });
     }
 
-    if (user.role === "admin" || user.id === req.user.id) {
-      return res.status(403).send({
-        message: "Admin account cannot be blocked.",
-      });
+    const user = await usersCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!user) {
+      return res.status(404).send({ message: "User not found" });
+    }
+
+    if (
+      user.role === "admin" ||
+      user._id.toString() === String(req.user.id)
+    ) {
+      return res.status(403).send({ message: "Cannot block this user" });
     }
 
     await usersCollection.updateOne(
-      { id },
+      { _id: new ObjectId(id) },
       {
         $set: {
           isBlocked: true,
@@ -1656,15 +1837,9 @@ app.patch("/admin/users/:id/block", requireAdmin, async (req, res) => {
       }
     );
 
-    res.status(200).send({
-      success: true,
-      message: "User blocked successfully.",
-    });
+    res.status(200).send({ message: "User blocked successfully" });
   } catch (error) {
-    console.log(error);
-    res.status(500).send({
-      message: "Failed to block user.",
-    });
+    res.status(500).send({ message: "Failed to block user" });
   }
 });
 
@@ -1672,8 +1847,15 @@ app.patch("/admin/users/:id/unblock", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid user ID" });
+    }
+
     const result = await usersCollection.updateOne(
-      { id, role: { $ne: "admin" } },
+      {
+        _id: new ObjectId(id),
+        role: { $ne: "admin" },
+      },
       {
         $set: {
           isBlocked: false,
@@ -1683,20 +1865,12 @@ app.patch("/admin/users/:id/unblock", requireAdmin, async (req, res) => {
     );
 
     if (result.matchedCount === 0) {
-      return res.status(404).send({
-        message: "Customer not found.",
-      });
+      return res.status(404).send({ message: "User not found" });
     }
 
-    res.status(200).send({
-      success: true,
-      message: "User unblocked successfully.",
-    });
+    res.status(200).send({ message: "User unblocked successfully" });
   } catch (error) {
-    console.log(error);
-    res.status(500).send({
-      message: "Failed to unblock user.",
-    });
+    res.status(500).send({ message: "Failed to unblock user" });
   }
 });
 
