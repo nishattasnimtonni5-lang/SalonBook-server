@@ -1617,16 +1617,14 @@ app.post("/offers", async (req, res) => {
         message: "Expiry date must be after start date.",
       });
     }
-
-    // The admin form (via Next.js /api/admin/offers) sends couponCode /
-    // applicableService / terms / minBookingAmount instead of promoCode /
-    // category / startDate / image. Store both shapes so every reader —
-    // filterValidOffers, manage-offers, the customer browser — finds its
-    // fields, with defaults for whatever the caller didn't send.
     const applicableService =
       typeof req.body.applicableService === "string"
         ? req.body.applicableService.trim()
         : "";
+        const applicableServiceId =
+  typeof req.body.applicableServiceId === "string"
+    ? req.body.applicableServiceId.trim()
+    : "";
     const couponCode =
       typeof req.body.couponCode === "string" ? req.body.couponCode.trim() : "";
     const terms = typeof req.body.terms === "string" ? req.body.terms : "";
@@ -1643,6 +1641,7 @@ app.post("/offers", async (req, res) => {
       promoCode: promoCode || couponCode || "",
       status: offerStatus,
       ...(applicableService ? { applicableService } : {}),
+      ...(applicableServiceId ? { applicableServiceId } : {}),
       ...(couponCode ? { couponCode } : {}),
       ...(terms ? { terms } : {}),
       ...(req.body.minBookingAmount !== undefined
@@ -1679,6 +1678,28 @@ app.get("/offers", async (req, res) => {
     res.status(500).send({
       message: "Failed to fetch offers.",
     });
+  }
+});
+app.delete("/offers/:id", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid offer ID" });
+    }
+
+    const result = await offersCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ message: "Offer not found" });
+    }
+
+    res.status(200).send({ message: "Offer deleted successfully" });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Failed to delete offer" });
   }
 });
 
