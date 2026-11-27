@@ -1867,6 +1867,39 @@ app.get("/admin/users", requireAdmin, async (req, res) => {
   }
 });
 
+
+app.get("/admin/users/:id/transactions", requireAdmin, async (req, res) => {
+  try {
+    const userId = req.params.id;
+
+    const appointments = await appointmentsCollection
+      .find({ userId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const transactions = appointments.map((appointment) => ({
+      _id: appointment._id.toString(),
+      appointmentId: appointment._id.toString(),
+      customerName: appointment.customerName || "",
+      customerEmail: appointment.customerEmail || "",
+      serviceName: appointment.serviceName || "",
+      appointmentDate: appointment.date || "",
+      appointmentTime: appointment.time || "",
+      paymentAmount: appointment.price || 0,
+      currency: appointment.currency || "USD",
+      paymentStatus: appointment.paymentStatus || "pending",
+      transactionDate: appointment.paidAt || appointment.createdAt || "",
+    }));
+
+    res.status(200).json({ transactions });
+  } catch (error) {
+    console.error("Failed to fetch user transactions:", error);
+    res.status(500).json({
+      message: "Failed to fetch user transactions",
+    });
+  }
+});
+
 app.patch("/admin/users/:id/block", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
