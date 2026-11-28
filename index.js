@@ -1052,26 +1052,47 @@ app.get("/services/featured", async (req, res) => {
   }
 });
 
-app.post("/appointments",requireActiveUser, async (req, res) => {
+app.post("/appointments", requireActiveUser, async (req, res) => {
   try {
-    // Clients may never choose booking/payment state: strip anything that
-    // belongs to the booking flow or the verified Stripe webhook.
     const appointmentData = { ...(req.body ?? {}) };
+
     delete appointmentData.status;
     delete appointmentData.paymentStatus;
     delete appointmentData.paidAt;
     delete appointmentData.cancelledAt;
     delete appointmentData.refundStatus;
 
+    const { date, time } = appointmentData;
+
+    if (!date || !time) {
+      return res.status(400).send({
+        success: false,
+        message: "Date and time are required",
+      });
+    }
+
+    const existingAppointment = await appointmentsCollection.findOne({
+      date,
+      time,
+      status: { $ne: "cancelled" },
+    });
+
+    if (existingAppointment) {
+      return res.status(409).send({
+        success: false,
+        message: "This time slot is already booked",
+      });
+    }
+
     const result = await appointmentsCollection.insertOne({
-  ...appointmentData,
-  userId: req.user.id,
-  status: "pending",
-  paymentStatus: "unpaid",
-  paidAt: null,
-  refundStatus: "none",
-  createdAt: new Date(),
-});
+      ...appointmentData,
+      userId: req.user.id,
+      status: "pending",
+      paymentStatus: "unpaid",
+      paidAt: null,
+      refundStatus: "none",
+      createdAt: new Date(),
+    });
 
     res.send({
       success: true,
@@ -1079,6 +1100,7 @@ app.post("/appointments",requireActiveUser, async (req, res) => {
     });
   } catch (error) {
     console.log(error);
+
     res.status(500).send({
       message: "Failed to book appointment",
     });
