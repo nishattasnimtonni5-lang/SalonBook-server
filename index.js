@@ -1870,31 +1870,56 @@ app.get("/admin/users", requireAdmin, async (req, res) => {
 
 app.get("/admin/users/:id/transactions", requireAdmin, async (req, res) => {
   try {
-    const userId = req.params.id;
+    const { id } = req.params;
 
-    const appointments = await appointmentsCollection
-      .find({ userId })
-      .sort({ createdAt: -1 })
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid user ID",
+      });
+    }
+
+    const user = await usersCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!user) {
+      return res.status(404).send({
+        message: "User not found",
+      });
+    }
+
+    const transactions = await transactionsCollection
+      .find({ userId: id })
+      .sort({ transactionDate: -1 })
       .toArray();
 
-    const transactions = appointments.map((appointment) => ({
-      _id: appointment._id.toString(),
-      appointmentId: appointment._id.toString(),
-      customerName: appointment.customerName || "",
-      customerEmail: appointment.customerEmail || "",
-      serviceName: appointment.serviceName || "",
-      appointmentDate: appointment.date || "",
-      appointmentTime: appointment.time || "",
-      paymentAmount: appointment.price || 0,
-      currency: appointment.currency || "USD",
-      paymentStatus: appointment.paymentStatus || "pending",
-      transactionDate: appointment.paidAt || appointment.createdAt || "",
+    const formattedTransactions = transactions.map((transaction) => ({
+      _id: transaction._id.toString(),
+      transactionId: transaction.stripeSessionId || transaction._id.toString(),
+      appointmentId: transaction.appointmentId?.toString() || "",
+      serviceName: transaction.serviceName || "N/A",
+      service: transaction.serviceName || "N/A",
+      amount: transaction.paymentAmount || 0,
+      price: transaction.paymentAmount || 0,
+      currency: transaction.currency || "USD",
+      paymentStatus: transaction.paymentStatus || "pending",
+      status: transaction.paymentStatus || "pending",
+      createdAt: transaction.transactionDate || transaction.createdAt || null,
+      date: transaction.transactionDate || transaction.createdAt || null,
+      appointmentDate: transaction.appointmentDate || "",
+      appointmentTime: transaction.appointmentTime || "",
+      customerName: transaction.customerName || "",
+      customerEmail: transaction.customerEmail || "",
     }));
 
-    res.status(200).json({ transactions });
+    res.status(200).send({
+      success: true,
+      transactions: formattedTransactions,
+    });
   } catch (error) {
     console.error("Failed to fetch user transactions:", error);
-    res.status(500).json({
+
+    res.status(500).send({
       message: "Failed to fetch user transactions",
     });
   }
