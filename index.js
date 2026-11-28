@@ -1925,6 +1925,37 @@ app.get("/admin/users/:id/transactions", requireAdmin, async (req, res) => {
   }
 });
 
+app.get("/transactions/:appointmentId", async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+
+    if (!ObjectId.isValid(appointmentId)) {
+      return res.status(400).send({
+        message: "Invalid appointment ID",
+      });
+    }
+
+    const transaction = await transactionsCollection.findOne({
+      appointmentId: new ObjectId(appointmentId),
+    });
+
+    if (!transaction) {
+      return res.status(404).send({
+        message: "Transaction not found",
+      });
+    }
+
+    res.send(transaction);
+  } catch (error) {
+    console.error("Failed to fetch transaction:", error);
+
+    res.status(500).send({
+      message: "Failed to fetch transaction",
+    });
+  }
+});
+
+
 app.patch("/admin/users/:id/block", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
